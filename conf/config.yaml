@@ -1,0 +1,97 @@
+system:
+  base_dir: "."
+  gpu_id: 0
+
+model:
+  # Architecture type: which GNN update rule to use
+  # - rnn: Standard RNN with weight matrices (works with VCG or LCG)
+  # - lstm: LSTM with gates, uses hidden state h_t for embeddings (works with VCG or LCG)
+  # - primal_dual: Simplified gradient-based update from paper (VCG only, no weight matrices)
+  update_type: rnn
+
+  # Graph representation type
+  # - var: Variable-Clause Graph (VCG) - bipartite graph between variables and clauses
+  # - lit: Literal-Clause Graph (LCG) - bipartite graph between literals and clauses
+  # CONSTRAINT: primal_dual only works with graph_type='var'
+  graph_type: var
+
+  # Model dimensions
+  d_model: 48                # Embedding dimension for all nodes
+  num_iters: 25              # Number of message passing iterations
+
+  # Edge features: use separate MLPs for positive/negative literal edges
+  use_edge_features: True    # True = separate pos_mlp and neg_mlp, False = simple +1/-1 adjacency
+
+  # Output heads configuration
+  use_clause_voting: False   # Use clause embeddings for SAT prediction (vs variable embeddings)
+  assignment_CE_loss: True   # Use cross-entropy for assignment (vs binary cross-entropy with sigmoid)
+
+  # Memory management
+  collect_embeddings: True   # Collect all iteration embeddings during validation (memory intensive, disable for large problems)
+
+train:
+  # Training duration
+  num_epochs: 100
+
+  # Optimization hyperparameters
+  lr: 5e-4                   # Initial learning rate (will use cosine annealing for first 50% of epochs, then constant)
+  weight_decay: 1e-10        # L2 regularization weight
+  gradient_clip_val: 0.65    # Gradient clipping threshold (prevents exploding gradients)
+
+  # Supervision mode: how to train the model
+  # - assignment: Standard supervised with ground truth assignments from SAT solver
+  # - closest_assignment: Use closest valid/maxsat assignment (via RC2 or local search)
+  # - sat: Only SAT/UNSAT classification (no assignment prediction)
+  # - unsupervised_linear: L_lin = -∑_c V_c (counts expected satisfied clauses, weak gradients near V_c=1)
+  # - unsupervised_log: L_log = -∑_c log(V_c) (amplifies gradients for unsatisfied clauses, penalty diverges as V_c→0)
+  # - unsupervised_quad: L_quad = ∑_c (1-V_c)² (stronger gradients than linear near V_c=1, no unbounded penalties)
+  # - combined: Assignment loss + unsupervised_linear loss
+  # Legacy names also supported: unsupervised1 (linear), unsupervised2 (log)
+  supervision_mode: assignment
+
+  # Closest assignment configuration (for supervision_mode='closest_assignment' or train_with_closest_assignment=True)
+  train_with_closest_assignment: True  # Use predetermined closest assignment from dataset preprocessing
+  closest_assignment_method: rc2       # Method for finding closest assignment: 'rc2' | 'walksat' | 'greedy'
+                                       # - rc2: MaxSAT solver (expensive but finds optimal closest assignment)
+                                       # - walksat: Random walk local search (fast, approximate, good for training)
+                                       # - greedy: Greedy variable flipping (fast, approximate)
+  num_local_search_steps: 10           # Number of steps for walksat/greedy (ignored for rc2)
+
+  # Instance weighting
+  sat_weight: 1.0            # Weight for SAT instances in loss (set < 1.0 to downweight SAT vs UNSAT)
+
+  # Exponential Moving Average (EMA) of parameters
+  use_ema: True              # Maintain shadow copy of parameters with exponential moving average
+  ema_decay: 0.999           # EMA decay rate (higher = slower adaptation, more stable)
+
+data:
+  # Dataset configuration
+  dataset_name: sr40         # Dataset name (used in path construction below)
+  data_path: "${system.base_dir}/temp/cnfs/${data.dataset_name}"
+
+  # Dataset sizes
+  trainset_size: 20000
+  valset_size: 2000
+  testset_size: 2000
+
+  # Data filtering
+  sat_only: False            # Only use SAT instances for training (ignore UNSAT), useful for some experiments
+
+  # Data loading configuration
+  in_memory: True            # Load entire dataset into RAM (fast but memory intensive, set False for large datasets)
+  num_workers: 4             # Number of DataLoader worker processes
+  batch_size: 64             # Batch size for training
+
+logging:
+  # Weights & Biases configuration
+  use_wandb: True            # Enable WandB logging (cloud-based experiment tracking)
+  wandb_project: "SAT_GNN"   # WandB project name
+
+  # Logging frequency
+  log_every_n_steps: 50      # Log training metrics every N steps
+
+checkpointing:
+  # Checkpoint saving strategy
+  save_top_k: 1              # Save only K best checkpoints (1 = only best, -1 = save all)
+  monitor: val_accuracy      # Metric to monitor for best checkpoint
+  mode: max                  # Maximize or minimize the monitored metric ('max' or 'min')
