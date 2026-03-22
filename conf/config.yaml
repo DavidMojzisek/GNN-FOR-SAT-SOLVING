@@ -1,97 +1,161 @@
 system:
-  base_dir: "."
+  base_dir: "."   # Resolved at runtime — Hydra sets cwd to hydra.run.dir, so checkpoints
+                  # land in <hydra.run.dir>/checkpoints/. Default: outputs/YYYY-MM-DD/HH-MM-SS/
+                  # Override with: hydra.run.dir=my_run  (see quickstart.sh for example)
   gpu_id: 0
+  seed: 0
+
+checkpoint: null   # Path to checkpoint for eval.py
 
 model:
-  # Architecture type: which GNN update rule to use
-  # - rnn: Standard RNN with weight matrices (works with VCG or LCG)
-  # - lstm: LSTM with gates, uses hidden state h_t for embeddings (works with VCG or LCG)
-  # - primal_dual: Simplified gradient-based update from paper (VCG only, no weight matrices)
-  update_type: rnn
+  # Update rule for message passing
+  # - rnn: Standard RNN with weight matrices (VCG or LCG)
+  # - lstm: LSTM, uses hidden state h_t as embedding, not cell output (VCG or LCG)
+  # - primal_dual: Gradient-inspired update without weight matrices (VCG only)
+  update_type: lstm
 
-  # Graph representation type
-  # - var: Variable-Clause Graph (VCG) - bipartite graph between variables and clauses
-  # - lit: Literal-Clause Graph (LCG) - bipartite graph between literals and clauses
-  # CONSTRAINT: primal_dual only works with graph_type='var'
+  # Graph representation
+  # - var: Variable-Clause Graph (VCG) — one node per variable, edge polarity ∈ {+1,-1}
+  # - lit: Literal-Clause Graph (LCG) — one node per literal (2n nodes total)
+  # CONSTRAINT: primal_dual requires graph_type=var
   graph_type: var
 
-  # Model dimensions
-  d_model: 48                # Embedding dimension for all nodes
-  num_iters: 25              # Number of message passing iterations
+  d_model: 64           # Embedding dimension
+  num_iters: 20         # Message passing iterations
 
-  # Edge features: use separate MLPs for positive/negative literal edges
-  use_edge_features: True    # True = separate pos_mlp and neg_mlp, False = simple +1/-1 adjacency
+  # VCG edge MLPs: separate MLPs for positive vs negative literal edges
+  use_edge_features: True
 
-  # Output heads configuration
-  use_clause_voting: False   # Use clause embeddings for SAT prediction (vs variable embeddings)
-  assignment_CE_loss: True   # Use cross-entropy for assignment (vs binary cross-entropy with sigmoid)
+  # Lightweight polarity encoding for VCG (mutually exclusive with use_edge_features).
+  # Concatenates a +1/-1 scalar to each source embedding before aggregation and
+  # projects back with a single Linear(d+1 → d). Encodes polarity at near-zero cost
+  # vs the dual-MLP approach. Ignored for lit graph (polarity handled by flip mechanism).
+  use_polarity_scalar: False
 
-  # Memory management
-  collect_embeddings: True   # Collect all iteration embeddings during validation (memory intensive, disable for large problems)
+  # Only relevant when use_edge_features=True:
+  # False (default) = V→C and C→V directions share the same pos/neg MLPs
+  # True            = each direction has independent pos/neg MLPs
+  separate_direction_mlps: False
+
+  use_clause_voting: False   # Use clause embeddings for SAT logit (vs variable embeddings)
+
+  # L2 normalisation of embeddings after each message-passing iteration.
+  # Works for all update types including rnn/lstm (empirically validated).
+  # null = auto: True for primal_dual, False otherwise
+  # true = always on  |  false = always off
+  normalize_embeddings: True
+
+  # Bias in the assignment and SAT/UNSAT output linear heads.
+  output_bias: true
+
+  # When True, model returns votes and embeddings for ALL message-passing iterations.
+  # Use for embedding evolution analysis or test-time scaling evaluation.
+  # False = only last iteration returned (saves memory).
+  collect_all_votes: False
 
 train:
-  # Training duration
-  num_epochs: 100
+  num_epochs: 300
+  lr: 1e-3
+  weight_decay: 1e-10
+  gradient_clip_val: 0.65
 
-  # Optimization hyperparameters
-  lr: 5e-4                   # Initial learning rate (will use cosine annealing for first 50% of epochs, then constant)
-  weight_decay: 1e-10        # L2 regularization weight
-  gradient_clip_val: 0.65    # Gradient clipping threshold (prevents exploding gradients)
+  # Supervision mode
+  # - assignment:          CE loss against fixed SAT-solver assignments
+  # - closest_assignment:  CE loss against nearby best assignment (see closest_assignment_method)
+  # - sat:                 BCE for SAT/UNSAT classification (no assignment target)
+  # - unsupervised_linear: L_lin = -∑_c V_c
+  # - unsupervised_log:    L_log = -∑_c log(V_c)
+  # - unsupervised_quad:   L_quad = ∑_c (1-V_c)²
+  supervision_mode: sat
 
-  # Supervision mode: how to train the model
-  # - assignment: Standard supervised with ground truth assignments from SAT solver
-  # - closest_assignment: Use closest valid/maxsat assignment (via RC2 or local search)
-  # - sat: Only SAT/UNSAT classification (no assignment prediction)
-  # - unsupervised_linear: L_lin = -∑_c V_c (counts expected satisfied clauses, weak gradients near V_c=1)
-  # - unsupervised_log: L_log = -∑_c log(V_c) (amplifies gradients for unsatisfied clauses, penalty diverges as V_c→0)
-  # - unsupervised_quad: L_quad = ∑_c (1-V_c)² (stronger gradients than linear near V_c=1, no unbounded penalties)
-  # - combined: Assignment loss + unsupervised_linear loss
-  # Legacy names also supported: unsupervised1 (linear), unsupervised2 (log)
-  supervision_mode: assignment
+  # Method for finding closest assignment (only used when supervision_mode=closest_assignment)
+  # - rc2:     MaxSAT exact solver — slowest, optimal target
+  # - walksat: WalkSAT local search — fast, online, approximate
+  # - greedy:  Greedy max-gain heuristic — fast, online, approximate
+  closest_assignment_method: rc2
+  num_local_search_steps: 10   # Steps for walksat/greedy (ignored for rc2)
 
-  # Closest assignment configuration (for supervision_mode='closest_assignment' or train_with_closest_assignment=True)
-  train_with_closest_assignment: True  # Use predetermined closest assignment from dataset preprocessing
-  closest_assignment_method: rc2       # Method for finding closest assignment: 'rc2' | 'walksat' | 'greedy'
-                                       # - rc2: MaxSAT solver (expensive but finds optimal closest assignment)
-                                       # - walksat: Random walk local search (fast, approximate, good for training)
-                                       # - greedy: Greedy variable flipping (fast, approximate)
-  num_local_search_steps: 10           # Number of steps for walksat/greedy (ignored for rc2)
+  # Learning rate schedule: 'cosine' (decay to 10% over first half) or 'constant' (no decay)
+  lr_schedule: constant
 
-  # Instance weighting
-  sat_weight: 1.0            # Weight for SAT instances in loss (set < 1.0 to downweight SAT vs UNSAT)
+  sat_weight: 1.0   # Weight multiplier for SAT instances in assignment loss (1.0 = equal weight)
 
-  # Exponential Moving Average (EMA) of parameters
-  use_ema: True              # Maintain shadow copy of parameters with exponential moving average
-  ema_decay: 0.999           # EMA decay rate (higher = slower adaptation, more stable)
+  # Warmup: use fixed assignment CE loss for this many epochs before switching to supervision_mode.
+  # 0 = disabled (default). Works with any supervision_mode.
+  fixed_assignment_warmup_epochs: 0
+
+  # Test-time resampling: run model N times, pick best assignment per formula.
+  # Exploits random embedding initialisation to explore multiple candidates cheaply.
+  # 1 = disabled (single forward pass), 3-5 = recommended for final evaluation.
+  num_test_samples: 1
+
+  # Exponential Moving Average of parameters (strongly recommended)
+  use_ema: True
+  ema_decay: 0.999
+
+  # Early stopping patience (epochs without improvement on val_dec_acc).
+  # Set >= num_epochs to effectively disable during curriculum experiments.
+  early_stopping_patience: 300
+
+  # Curriculum learning (only for supervision_mode=sat)
+  curriculum:
+    enabled: True
+    min_vars: 3           # Start with formulas of this many variables
+    max_vars: 40          # Stop expanding at this size
+    step: 2               # Increase max_vars by this amount per stage
+    # Advancement threshold: linearly scheduled from min to max across stages
+    # (e.g. at size 3: need 60%; at size 40: need 80%)
+    acc_threshold_min: 0.60
+    acc_threshold_max: 0.80
+    patience: 50          # Force stage advance after this many epochs regardless
+    window_stages: 4      # Include this many previous stages in training (sliding window)
+                          # Note: at max_vars stage the window is always expanded to full
+                          # [min_vars, max_vars] range to prevent overfitting on small subset.
+    # Cosine LR decay starting when max_vars is reached, over this many epochs.
+    # Set to null to keep constant LR throughout.
+    post_curriculum_cosine_epochs: null
 
 data:
-  # Dataset configuration
-  dataset_name: sr40         # Dataset name (used in path construction below)
-  data_path: "${system.base_dir}/temp/cnfs/${data.dataset_name}"
+  dataset_name: sr40
+  data_path: "${system.base_dir}/data/cnfs/${data.dataset_name}"
 
-  # Dataset sizes
-  trainset_size: 20000
-  valset_size: 2000
-  testset_size: 2000
+  trainset_size: 60000
+  valset_size: 1000
+  testset_size: 1000
 
-  # Data filtering
-  sat_only: False            # Only use SAT instances for training (ignore UNSAT), useful for some experiments
+  sat_only: False    # Train on SAT instances only (useful with assignment mode)
 
-  # Data loading configuration
-  in_memory: True            # Load entire dataset into RAM (fast but memory intensive, set False for large datasets)
-  num_workers: 4             # Number of DataLoader worker processes
-  batch_size: 64             # Batch size for training
+  # Mixed-size val dataset for curriculum-stage monitoring (val_curr_* metrics).
+  # Must cover the same variable range as the train set (e.g. 3-40 for sr40).
+  # Required when curriculum.enabled=True — without it, val_curr_* = val_* (wrong).
+  # Set to null to disable (will warn at startup).
+  curriculum_val_path: "${system.base_dir}/data/cnfs/${data.dataset_name}_curriculum/val"
+  curriculum_valset_size: 3800   # ~100 instances per size level (38 sizes × 100, min_n=3)
+
+  in_memory: True    # Load full dataset into RAM (fast but memory-heavy)
+  num_workers: 4
+  batch_size: 64
 
 logging:
-  # Weights & Biases configuration
-  use_wandb: True            # Enable WandB logging (cloud-based experiment tracking)
-  wandb_project: "SAT_GNN"   # WandB project name
-
-  # Logging frequency
-  log_every_n_steps: 50      # Log training metrics every N steps
+  use_wandb: True            # Set True to enable WandB experiment tracking
+  wandb_project: "SAT_GNN"
+  log_every_n_steps: 50
 
 checkpointing:
-  # Checkpoint saving strategy
-  save_top_k: 1              # Save only K best checkpoints (1 = only best, -1 = save all)
-  monitor: val_accuracy      # Metric to monitor for best checkpoint
-  mode: max                  # Maximize or minimize the monitored metric ('max' or 'min')
+  monitor: val_dec_acc   # Metric to track for best checkpoint (val_sat_acc is a useful alternative)
+  mode: max
+  save_top_k: 1          # Save only the single best checkpoint
+  save_last: True        # Also save a last.ckpt (overwritten each epoch)
+
+eval:
+  # List of dataset paths for multi-dataset evaluation.
+  # null = evaluate on data.data_path only.
+  # Example: ["./data/cnfs/sr40", "./data/cnfs/sr100", "./data/cnfs/3sat100"]
+  datasets: null
+
+  # Plot avg gap vs message-passing iterations (overrides model.num_iters at test time).
+  scaling_analysis: false
+  max_test_iters: 100    # Max iterations for scaling analysis (model trained on fewer is fine)
+
+  save_plots: true
+  plots_dir: "./eval_plots"

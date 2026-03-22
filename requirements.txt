@@ -14,8 +14,6 @@ wandb==0.20.1
 
 # SAT solvers
 python-sat==1.8.dev17
-z3-solver==4.15.1.0
-pyunigen==2.5.8
 
 # CNF generation
 cnfgen>=0.9.0
@@ -28,6 +26,9 @@ scikit-learn==1.6.1
 
 # Graph and network tools
 networkx==3.2.1
+
+# Plotting
+matplotlib
 
 # Utilities
 tqdm

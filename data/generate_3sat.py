@@ -2,6 +2,7 @@ import math
 import numpy as np
 import random
 import os
+import shutil
 import argparse
 from pysat.solvers import Glucose3
 import networkx as nx
@@ -88,12 +89,10 @@ if __name__ == "__main__":
     if opts.np_seed is not None: np.random.seed(opts.np_seed)
     
     out_dir = opts.out_dir
-    if not os.path.exists(out_dir):
-        os.makedirs(out_dir)
-    else:
+    if os.path.exists(out_dir):
         print("Output directory %s already exists. Replacing." % out_dir)
-        os.system("rm -rf %s" % out_dir)
-        os.makedirs(out_dir)
+        shutil.rmtree(out_dir)
+    os.makedirs(out_dir)
     
     for i in range(opts.n_instances):
         if i % opts.print_interval == 0: print("[%d]" % i)

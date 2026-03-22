@@ -1,207 +1,207 @@
-import pytorch_lightning as pl
+import math
+import logging
+
 import torch
-import numpy as np
+import torch.nn.functional as F
+import pytorch_lightning as pl
 from models.model import GNN_SAT
-from models.losses import (compute_sat_loss, compute_assignment_CE_loss,
-                           compute_unsupervised_loss_linear, compute_unsupervised_loss_log, compute_unsupervised_loss_quad,
-                           compute_unsupervised_loss_1, compute_unsupervised_loss_2,
-                           compute_closest_assignment_CE_loss)
-from models.metrics import compute_metrics
+from models.losses import (
+    _get_var_votes,
+    compute_sat_loss,
+    compute_assignment_CE_loss,
+    compute_closest_assignment_CE_loss,
+    compute_walksat_assignment_CE_loss,
+    compute_unsupervised_loss_linear,
+    compute_unsupervised_loss_log,
+    compute_unsupervised_loss_quad,
+)
+from models.metrics import compute_metrics, compute_metrics_resampled
 
 
 class LitModel(pl.LightningModule):
-   def __init__(self, model_cfg, lr, weight_decay, supervision_mode='sat',
-                train_with_closest_assignment=False, sat_weight=1.0):
-       """
-       Initialize the primal-dual GNN model.
+    """
+    PyTorch Lightning wrapper for GNN_SAT.
 
-       Args:
-           model_cfg: Model configuration
-           lr: Learning rate
-           weight_decay: Weight decay
-           supervision_mode: Type of supervision ('sat', 'assignment', 'unsupervised_linear', 'unsupervised_log', 'unsupervised_quad', 'combined')
-                             Also supports legacy names: 'unsupervised1' (linear), 'unsupervised2' (log)
-           train_with_closest_assignment: Whether to train with closest assignments
-           sat_weight: Weight for SAT instances (UNSAT instances have weight 1.0)
-       """
-       super().__init__()
-       self.save_hyperparameters(ignore=['model'])
+    Supervision modes:
+      assignment          — CE loss against fixed solver assignments
+      closest_assignment  — CE loss against best nearby assignment (see closest_assignment_method)
+      sat                 — BCE loss for SAT/UNSAT classification only
+      unsupervised_linear — L_lin = -∑_c V_c
+      unsupervised_log    — L_log = -∑_c log(V_c)
+      unsupervised_quad   — L_quad = ∑_c (1-V_c)²
 
-       # Only GNN_SAT for primal-dual
-       self.model = GNN_SAT(
+    Closest assignment methods (only used when supervision_mode='closest_assignment'):
+      rc2     — MaxSAT exact solver (slowest, optimal)
+      walksat — WalkSAT local search (fast, online, approximate)
+      greedy  — Greedy max-gain heuristic (fast, online, approximate)
+    """
+
+    def __init__(self, model_cfg, lr, weight_decay,
+                 supervision_mode='assignment',
+                 closest_assignment_method='rc2',
+                 num_local_search_steps=10,
+                 sat_weight=1.0,
+                 num_test_samples=1,
+                 lr_schedule='cosine',
+                 fixed_assignment_warmup_epochs=0,
+                 # Legacy flag — deprecated, use supervision_mode='closest_assignment'
+                 train_with_closest_assignment=False):
+        super().__init__()
+        self.save_hyperparameters()
+
+        self.model = GNN_SAT(
             d_model=model_cfg.d_model,
             update_type=model_cfg.update_type,
             graph_type=model_cfg.graph_type,
-            collect_embeddings=model_cfg.collect_embeddings,
             use_edge_features=model_cfg.get('use_edge_features', False),
+            use_polarity_scalar=model_cfg.get('use_polarity_scalar', False),
             use_clause_voting=model_cfg.get('use_clause_voting', False),
-            assignment_CE_loss=True  # Always use CE loss for assignment
+            separate_direction_mlps=model_cfg.get('separate_direction_mlps', False),
+            collect_all_votes=model_cfg.get('collect_all_votes', False),
+            normalize_embeddings=model_cfg.get('normalize_embeddings', None),
+            output_bias=model_cfg.get('output_bias', True),
         )
-       self.lr = lr
-       self.weight_decay = weight_decay
-       self.num_iters = model_cfg.num_iters
+        self.lr = lr
+        self.weight_decay = weight_decay
+        self.num_iters = model_cfg.num_iters
+        self._train_loss_accum = []
 
-       self.supervision_mode = supervision_mode
+        # Resolve supervision mode — legacy flag takes lowest priority
+        if supervision_mode == 'assignment' and train_with_closest_assignment:
+            logging.warning(
+                "train_with_closest_assignment=True is deprecated. "
+                "Use supervision_mode='closest_assignment' instead. "
+                "Treating as closest_assignment with method=rc2."
+            )
+            supervision_mode = 'closest_assignment'
+            closest_assignment_method = 'rc2'
 
-       # Add parameter for closest assignment training (only used with assignment supervision)
-       self.train_with_closest_assignment = train_with_closest_assignment
+        self.supervision_mode = supervision_mode
+        self.closest_assignment_method = closest_assignment_method
+        self.num_local_search_steps = num_local_search_steps
+        self.sat_weight = sat_weight
+        self.num_test_samples = num_test_samples
+        self.lr_schedule = lr_schedule
+        self.fixed_assignment_warmup_epochs = fixed_assignment_warmup_epochs
 
-       # Add parameter for SAT weighting
-       self.sat_weight = sat_weight
-       
-   def _get_loss(self, outputs, batch):
-       # Only use closest assignment training if supervision mode is assignment
-       if self.supervision_mode == 'assignment':
-           if self.train_with_closest_assignment:
-               return compute_closest_assignment_CE_loss(outputs, batch, self.model.graph_type)
-           elif self.sat_weight != 1.0:
-               # Apply SAT weighting to standard assignment loss
-               device = batch.y.device
-               
-               # Get model predictions
-               if self.model.graph_type == 'lit':    
-                   # For lit graph, extract just the positive literals
-                   grouped_votes = [outputs['final_votes'][batch.x_l_batch==i] for i in range(batch.x_l_batch.max()+1)]
-                   processed_votes = []
-                   for votes in grouped_votes:
-                       n_vars = votes.size(0) // 2
-                       var_votes = votes[:n_vars]
-                       processed_votes.append(var_votes)
-                   votes = torch.cat(processed_votes)
-               else:
-                   # For var graph, use all predictions
-                   votes = outputs['final_votes']
-               
-               # Get targets from batch assignments
-               targets = ((batch.assignment + 1) / 2).long().to(device)
-               
-               # Apply SAT instance weighting
-               var_cumsum = torch.cumsum(batch.num_variables, dim=0)
-               sample_weights = torch.ones_like(targets, dtype=torch.float)
-               
-               # Assign weight based on whether the formula is SAT or UNSAT
-               for i in range(len(batch.y)):
-                   start_idx = 0 if i == 0 else var_cumsum[i-1].item()
-                   end_idx = var_cumsum[i].item()
-                   
-                   # Higher weight for SAT instances
-                   is_sat = batch.y[i].item() == 1
-                   formula_weight = self.sat_weight if is_sat else 1.0
-                   sample_weights[start_idx:end_idx] = formula_weight
-               
-               # Normalize weights to maintain gradient magnitude
-               if sample_weights.sum() > 0:
-                   sample_weights = sample_weights * len(sample_weights) / sample_weights.sum()
-               
-               # Compute weighted cross entropy loss
-               criterion = torch.nn.CrossEntropyLoss(reduction='none')
-               per_sample_loss = criterion(votes, targets)
-               weighted_loss = (per_sample_loss * sample_weights).mean()
-               
-               return weighted_loss
-           else:
-               # Standard assignment loss without weighting
-               return compute_assignment_CE_loss(outputs, batch, self.model.graph_type)
-           
-       # For other supervision modes, use the appropriate loss function
-       if self.supervision_mode == 'sat':
-           return compute_sat_loss(outputs, batch)
-       elif self.supervision_mode in ["unsupervised_linear", "unsupervised1"]:
-           return compute_unsupervised_loss_linear(outputs, batch, self.model.graph_type)
-       elif self.supervision_mode in ["unsupervised_log", "unsupervised2"]:
-           return compute_unsupervised_loss_log(outputs, batch, self.model.graph_type)
-       elif self.supervision_mode == "unsupervised_quad":
-           return compute_unsupervised_loss_quad(outputs, batch, self.model.graph_type)
-       elif self.supervision_mode == "combined":
-            assignment_loss = compute_assignment_CE_loss(outputs, batch, self.model.graph_type)
-            unsup_loss = compute_unsupervised_loss_linear(outputs, batch, self.model.graph_type)
-            return assignment_loss + unsup_loss
-       else:
-           raise ValueError(f"Unknown supervision mode: {self.supervision_mode}")
-        
-   def training_step(self, batch, batch_idx):
-       self.log('learning_rate', self.optimizers().param_groups[0]['lr'], prog_bar=True, on_step=False, on_epoch=True)
+    def _get_loss(self, outputs, batch):
+        mode = self.supervision_mode
 
-       # Only print information about the current loss at the beginning of each epoch
-       if batch_idx == 0:
-           if self.train_with_closest_assignment and self.supervision_mode == 'assignment':
-               print(f"\nEpoch {self.trainer.current_epoch}: Using closest assignment loss")
-           elif self.sat_weight != 1.0 and self.supervision_mode == 'assignment':
-               print(f"\nEpoch {self.trainer.current_epoch}: Using assignment loss with SAT weight={self.sat_weight}")
-           else:
-               print(f"\nEpoch {self.trainer.current_epoch}: Using {self.supervision_mode} loss")
+        if mode == 'assignment':
+            if self.sat_weight != 1.0:
+                return self._weighted_assignment_loss(outputs, batch)
+            return compute_assignment_CE_loss(outputs, batch, self.model.graph_type)
 
-       # Run the model forward pass
-       outputs = self.model(batch, self.num_iters)
+        if mode == 'closest_assignment':
+            method = self.closest_assignment_method
+            if method == 'rc2':
+                return compute_closest_assignment_CE_loss(outputs, batch, self.model.graph_type)
+            elif method in ('walksat', 'greedy'):
+                return compute_walksat_assignment_CE_loss(
+                    outputs, batch, self.model.graph_type,
+                    num_steps=self.num_local_search_steps, method=method
+                )
+            else:
+                raise ValueError(f"Unknown closest_assignment_method: '{method}'. Choose rc2/walksat/greedy")
 
-       # Get loss using the appropriate method
-       loss = self._get_loss(outputs, batch)
-       self.log('train_loss', loss, prog_bar=True)
+        if mode == 'sat':
+            return compute_sat_loss(outputs, batch)
+        if mode == 'unsupervised_linear':
+            return compute_unsupervised_loss_linear(outputs, batch, self.model.graph_type)
+        if mode == 'unsupervised_log':
+            return compute_unsupervised_loss_log(outputs, batch, self.model.graph_type)
+        if mode == 'unsupervised_quad':
+            return compute_unsupervised_loss_quad(outputs, batch, self.model.graph_type)
 
-       return loss
+        raise ValueError(f"Unknown supervision_mode: '{mode}'")
 
-   def validation_step(self, batch, batch_idx):
-       """
-       Validation step.
+    def _weighted_assignment_loss(self, outputs, batch):
+        """Assignment CE loss with higher weight for SAT instances (vectorised)."""
+        votes = _get_var_votes(outputs, batch, self.model.graph_type)
+        targets = ((batch.assignment + 1) / 2).long().to(votes.device)
 
-       Args:
-           batch: The input batch
-           batch_idx: Index of the batch
+        # Build per-formula weight vector then expand to per-variable weights
+        weight_per_formula = torch.where(
+            batch.y == 1,
+            torch.full_like(batch.y, self.sat_weight),
+            torch.ones_like(batch.y),
+        )
+        weights = torch.repeat_interleave(weight_per_formula, batch.num_variables.long())
 
-       Returns:
-           Validation loss
-       """
-       outputs = self.model(batch, self.num_iters)
-       loss = self._get_loss(outputs, batch)
+        # Normalise to preserve gradient magnitude
+        weights = weights * len(weights) / weights.sum()
+        loss = F.cross_entropy(votes, targets, reduction='none')
+        return (loss * weights).mean()
 
-       # Standard metrics calculation based on supervision mode
-       metrics = compute_metrics(outputs, batch, self.supervision_mode, self.model.graph_type)
+    def training_step(self, batch, batch_idx):
+        outputs = self.model(batch, self.num_iters)
+        if (self.fixed_assignment_warmup_epochs > 0
+                and self.trainer.current_epoch < self.fixed_assignment_warmup_epochs):
+            loss = compute_assignment_CE_loss(outputs, batch, self.model.graph_type)
+        else:
+            loss = self._get_loss(outputs, batch)
+        self._train_loss_accum.append(loss.detach())
+        self.log('lr', self.optimizers().param_groups[0]['lr'],
+                 prog_bar=True, on_step=False, on_epoch=True)
+        return loss
 
-       # Log all metrics
-       self.log('val_loss', loss, prog_bar=True)
-       for name, value in metrics.items():
-           self.log(f'val_{name}', value, prog_bar=True)
-       return loss
+    def on_validation_epoch_end(self):
+        # Log train_loss here so it shares the same wandb step as val metrics.
+        # If logged in training_step, PL commits it at end of train epoch (different step).
+        if self._train_loss_accum:
+            avg = torch.stack(self._train_loss_accum).mean()
+            self.log('train_loss', avg, prog_bar=True)
+            self._train_loss_accum = []
 
-   def test_step(self, batch, batch_idx):
-       """
-       Test step - identical to validation step but logs with test_ prefix.
-       """
-       outputs = self.model(batch, self.num_iters)
-       loss = self._get_loss(outputs, batch)
+    def validation_step(self, batch, batch_idx, dataloader_idx=0):
+        # dataloader_idx=0: full val set  |  dataloader_idx=1: curriculum-filtered val set
+        prefix = 'val' if dataloader_idx == 0 else 'val_curr'
+        outputs = self.model(batch, self.num_iters)
+        loss = self._get_loss(outputs, batch)
+        metrics = compute_metrics(outputs, batch, self.supervision_mode, self.model.graph_type)
+        self.log(f'{prefix}_loss', loss, prog_bar=(prefix == 'val'), add_dataloader_idx=False)
+        for name, value in metrics.items():
+            prog = (prefix == 'val') and (name in ('dec_acc', 'sat_acc', 'avg_gap'))
+            self.log(f'{prefix}_{name}', value, prog_bar=prog, add_dataloader_idx=False)
+        return loss
 
-       # Standard metrics calculation based on supervision mode
-       metrics = compute_metrics(outputs, batch, self.supervision_mode, self.model.graph_type)
+    def test_step(self, batch, batch_idx):
+        outputs = self.model(batch, self.num_iters)
+        loss = self._get_loss(outputs, batch)
 
-       # Log all metrics with test_ prefix
-       self.log('test_loss', loss, prog_bar=True)
-       for name, value in metrics.items():
-           self.log(f'test_{name}', value, prog_bar=True)
-       return loss
+        if self.num_test_samples > 1:
+            metrics = compute_metrics_resampled(
+                self.model, batch, self.num_iters,
+                self.supervision_mode, self.model.graph_type,
+                n_samples=self.num_test_samples
+            )
+        else:
+            metrics = compute_metrics(outputs, batch, self.supervision_mode, self.model.graph_type)
 
-   def configure_optimizers(self):
-       optimizer = torch.optim.Adam(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
-       min_lr = self.lr * 0.1  # Set explicit minimum LR 1e-5
-    
-       # Use a custom lambda function to define our schedule
-       def lr_lambda(epoch):
-           if epoch < self.trainer.max_epochs // 2:
-               # Cosine annealing for first half of training
-               cosine_factor = 0.5 * (1 + torch.cos(torch.tensor(epoch / (self.trainer.max_epochs // 2) * torch.pi))).item()
-               return min_lr/self.lr + (1 - min_lr/self.lr) * cosine_factor
-           else:
-               # Constant minimum LR for second half
-               return min_lr/self.lr
-    
-       scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-    
-       return {
-           "optimizer": optimizer,
-           "lr_scheduler": {
-               "scheduler": scheduler,
-               "interval": "epoch",
-               "frequency": 1,
-               "monitor": None,
-               "strict": True
-           }
-       }
+        self.log('test_loss', loss, prog_bar=True)
+        for name, value in metrics.items():
+            self.log(f'test_{name}', value, prog_bar=(name in ('dec_acc', 'sat_acc')))
+        return loss
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.AdamW(
+            self.parameters(), lr=self.lr, weight_decay=self.weight_decay
+        )
+
+        if self.lr_schedule == 'constant':
+            return optimizer
+
+        min_lr = self.lr * 0.1
+
+        def lr_lambda(epoch):
+            half = max(self.trainer.max_epochs // 2, 1)
+            if epoch < half:
+                cosine = 0.5 * (1 + math.cos(math.pi * epoch / half))
+                return min_lr / self.lr + (1 - min_lr / self.lr) * cosine
+            return min_lr / self.lr
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {"scheduler": scheduler, "interval": "epoch", "frequency": 1},
+        }

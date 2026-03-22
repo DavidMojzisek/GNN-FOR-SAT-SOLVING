@@ -17,6 +17,7 @@ import math
 import numpy as np
 import random
 import os
+import shutil
 import argparse
 from pysat.solvers import Glucose3
 
@@ -43,8 +44,6 @@ def gen_iclause_pair(opts):
     n = random.randint(opts.min_n, opts.max_n)
 
     solver = Glucose3()
-    #for i in range(n): solver.new_var(dvar=True)
-
     iclauses = []
 
     while True:
@@ -84,12 +83,10 @@ if __name__ == "__main__":
     if opts.np_seed is not None: np.random.seed(opts.np_seed)
     out_dir = opts.out_dir
     # create output directory..replace if it exists
-    if not os.path.exists(out_dir):
-        os.makedirs(out_dir)
-    else:
+    if os.path.exists(out_dir):
         print("Output directory %s already exists. Replacing." % out_dir)
-        os.system("rm -rf %s" % out_dir)
-        os.makedirs(out_dir)
+        shutil.rmtree(out_dir)
+    os.makedirs(out_dir)
 
     for pair in range(opts.n_pairs):
         if pair % opts.print_interval == 0: print("[%d]" % pair)
@@ -99,6 +96,5 @@ if __name__ == "__main__":
 
         iclauses.append(iclause_unsat)
         write_dimacs_to(n_vars, iclauses, out_filenames[0])
-
         iclauses[-1] = iclause_sat
         write_dimacs_to(n_vars, iclauses, out_filenames[1])

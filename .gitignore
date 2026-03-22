@@ -46,12 +46,14 @@ checkpoints/
 *.pt
 *.pth
 
-# Data directories
-data/train/
-data/val/
-data/test/
+# Data directories (generated — not tracked)
+data/cnfs/
 temp/
-cnfs/
+
+# Eval outputs
+eval_plots/
+quickstart_output/
+test_output/
 
 # WandB
 wandb/
